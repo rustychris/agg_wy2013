@@ -15,6 +15,7 @@
 import logging
 log = logging.getLogger()
 
+import re
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from shapely import geometry, wkt
@@ -37,6 +38,19 @@ import six
 from matplotlib import gridspec
 
 cmap=scmap.load_gradient('turbo.cpt') # a less offensive 'jet'
+def hydro_name(hydro):
+    """
+    Convenience method -- get a representative name for a hydro 
+    object to use in naming runs.  Attempts hydro.name, falls
+    back on base dir if a HydroFiles object.
+    """
+    try:
+        return hydro.name
+    except AttributeError:
+        pass
+    if isinstance(hydro,dwaq.HydroFiles):
+        return os.path.basename(os.path.dirname(hydro.hyd_path))
+    raise Exception("Can't figure out good name for %s"%hydro)
 
 def configure_dwaq():
     # configure DWAQ:
@@ -88,7 +102,7 @@ class CommonSetup(object):
     
             log.info("base_path defaults to %s"%self.base_path)
     def calc_base_path(self):
-        p='run_%s_%s'%(self.hydro.name,self.name)
+        p='run_%s_%s'%(hydro_name(self.hydro),self.name)
         if self.base_x_dispersion!=0.0:
             p+="_Kx%g"%self.base_x_dispersion
         if self.scale_v_disp!=1.0:
@@ -380,6 +394,12 @@ class DecayingPlume(CommonSetup):
     
     tracer_clim=[0,0.5]
     age_clim=[0,60]
+
+    def calc_base_path(self):
+        b=super(DecayingPlume,self).calc_base_path()
+        if self.decay_rate!=0.01: # the default
+            b+="_decay%g"%self.decay_rate
+        return b
     
     def setup_tracers(self):
         # boundary condition will default to 0.0
@@ -462,11 +482,11 @@ class DecayingPlume(CommonSetup):
         ds.close() # keeping this open can interfere with deleting or overwriting the netcdf file.
 
 # pretty slow. maybe 2 minutes?
-@memoize
-def agger():
+@memoize(key_method='str')
+def agger(hydro_orig,agg_grid):
     return dwaq.HydroAggregator(hydro_orig,agg_shp=agg_grid)
 
-def agg_decay_tracers(model,force=False):
+def agg_decay_tracers(model,hydro_orig,agg_grid,force='auto'):
     def reckless_nanmean(*a,**kw):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -478,8 +498,12 @@ def agg_decay_tracers(model,force=False):
     
     age_orig_agg2ds=[]
 
-    if os.path.exists(precalc_fn) and force:
-        os.unlink(precalc_fn)
+    if os.path.exists(precalc_fn):
+        if force=='auto':
+            # compare precalc_fn to map_fn 
+            force=utils.is_stale(precalc_fn,[model.map_ds_path()])
+        if force:
+            os.unlink(precalc_fn)
         
     if not os.path.exists(precalc_fn):
         model_grid=model.load_hydro().grid()
@@ -503,7 +527,20 @@ def agg_decay_tracers(model,force=False):
         ds.close()
         
         nc=netCDF4.Dataset(precalc_fn,mode='r+')
-        
+
+        def condense(scal):
+            """
+            take a 3D, potentially unaggregated scalar field,
+            aggregate, nanmean, and condense to 2D.
+            """
+            # then aggregate but avoid nan contamination
+            if needs_aggregation:
+                scal_agg=agger(hydro_orig,agg_grid).segment_aggregator(t_sec,scal.ravel(),nan_method='ignore').reshape((layers,-1))
+            else:
+                scal_agg=scal
+            scal_agg2d=reckless_nanmean(scal_agg,axis=0)
+            return scal_agg2d
+
         for tracer in range(5): # max number of decay tracers
             cTr="cTr%d"%(tracer+1)
             dTr="dTr%d"%(tracer+1)
@@ -513,25 +550,28 @@ def agg_decay_tracers(model,force=False):
             
             nc_var=nc.createVariable('age%d'%(tracer+1),np.float32,('time','face'),
                                      zlib=True,complevel=2)
+            nc_var_cons=nc.createVariable(cTr,np.float32,('time','face'),
+                                          zlib=True,complevel=2)
+            nc_var_decay=nc.createVariable(dTr,np.float32,('time','face'),
+                                           zlib=True,complevel=2)
             
             for t_idx in utils.progress(range(orig_map_ds.dims['time'])):
                 t_sec=orig_map_ds['t_sec'].isel(time=t_idx).values
-                age_orig=recalc_age(orig_map_ds[cTr].isel(time=t_idx).values,
-                                    orig_map_ds[dTr].isel(time=t_idx).values )
-                # then aggregate but avoid nan contamination
-                if needs_aggregation:
-                    age_orig_agg3d=agger().segment_aggregator(t_sec,age_orig.ravel(),nan_method='ignore')
-                    age_orig_agg2d=reckless_nanmean( age_orig_agg3d.reshape((layers,-1)),axis=0)
-                else:
-                    age_orig_agg2d=reckless_nanmean(age_orig, axis=0)
-                nc_var[t_idx,:]=age_orig_agg2d
+                cTr_orig=orig_map_ds[cTr].isel(time=t_idx).values
+                dTr_orig=orig_map_ds[dTr].isel(time=t_idx).values 
+                age_orig=recalc_age(cTr_orig,dTr_orig)
+                    
+                nc_var[t_idx,:]=condense(age_orig)
+                nc_var_cons[t_idx,:]=condense(cTr_orig)
+                nc_var_decay[t_idx,:]=condense(dTr_orig)
             nc.sync()
         nc.close()
         
     return xr.open_dataset(precalc_fn)
 
 # Wrap up the comparison into one method
-def decay_metrics(test_ds,ref_ds,t_slc,cell_sel,lp_hours_ref=36):
+def decay_metrics(test_ds,ref_ds,t_slc,cell_sel,lp_hours_ref=36,
+                  tracer_pattern='age.*'):
     """
     test_ds: dataset with age1..agen fields, each with dimensions time,face.
     ref_ds: same, but the "correct" data.
@@ -539,37 +579,37 @@ def decay_metrics(test_ds,ref_ds,t_slc,cell_sel,lp_hours_ref=36):
     t_slc: subset of times to use
     cell_sel: subset of cells to use
     lp_hours_ref: lowpass cutoff in hours for the reference data.
+    tracer_pattern: a regular expression for which tracers in the datasets will be considered
     """
-    ages=[]
-    for i in range(5):
-        v='age%d'%(i+1)
-        if (v in test_ds) and (v in ref_ds):
-            ages.append(v)
+    tracers=[]
+    for v in test_ds.variables:
+        if re.match(tracer_pattern,v) and (v in ref_ds):
+            tracers.append(v)
     
-    score_per_age=[]
+    score_per_tracer=[]
     
-    for age in ages:
+    for tracer in tracers:
         if lp_hours_ref is not None:
-            ref_age_full=ref_ds[age].isel(face=cell_sel).values
+            ref_tracer_full=ref_ds[tracer].isel(face=cell_sel).values
             dt_s=np.median(np.diff(ref_ds.time.values))/np.timedelta64(1,'s')
-            ref_age_lp=filters.lowpass(ref_age_full,cutoff=lp_hours_ref*3600,dt=dt_s,
+            ref_tracer_lp=filters.lowpass(ref_tracer_full,cutoff=lp_hours_ref*3600,dt=dt_s,
                                        axis=0)
-            ref_ages=xr.DataArray(ref_age_lp[t_slc,:],dims=['time','face'])
+            ref_tracers=xr.DataArray(ref_tracer_lp[t_slc,:],dims=['time','face'])
         else:
-            ref_ages=ref_ds[age].isel(time=t_slc,face=cell_sel)
-        test_ages=test_ds[age].isel(time=t_slc,face=cell_sel)
-        assert np.all( np.isfinite(ref_ages.values))
-        assert np.all( np.isfinite(test_ages.values))
+            ref_tracers=ref_ds[tracer].isel(time=t_slc,face=cell_sel)
+        test_tracers=test_ds[tracer].isel(time=t_slc,face=cell_sel)
+        assert np.all( np.isfinite(ref_tracers.values))
+        assert np.all( np.isfinite(test_tracers.values))
         
-        #wilmott=utils.model_skill(test_ages.values.ravel(), ref_ages.values.ravel() )
-        #score_per_age.append(wilmott)
-        test_vals=test_ages.values.ravel()
-        metrics=calc_metrics(test_vals, ref_ages.values.ravel())
+        #wilmott=utils.model_skill(test_tracers.values.ravel(), ref_tracers.values.ravel() )
+        #score_per_tracer.append(wilmott)
+        test_vals=test_tracers.values.ravel()
+        metrics=calc_metrics(test_vals, ref_tracers.values.ravel())
         metrics['nan_fraction']=np.isnan(test_vals).sum() / float(len(test_vals))
-        score_per_age.append(metrics)
+        score_per_tracer.append(metrics)
     res={}
-    for k in score_per_age[0]:
-        res[k]=np.mean([ m[k] for m in score_per_age])
+    for k in score_per_tracer[0]:
+        res[k]=np.mean([ m[k] for m in score_per_tracer])
     return res
 
 class Kauto(object):
@@ -593,37 +633,38 @@ class Kauto(object):
         self.wm.dispersions['anisoK']=dwaq.DispArray(substances=".*",data=Kexch)
         
     def disp_array(self):
-        self.hydro.infer_2d_elements()
-        self.hydro.infer_2d_links()
+        hydro=self.hydro
+        hydro.infer_2d_elements()
+        hydro.infer_2d_links()
         
         K=np.zeros(self.hydro.n_exch,np.float64)
 
-        Qaccum=np.zeros(self.hydro.n_2d_links,np.float64)
-        Aaccum=np.zeros(self.hydro.n_2d_links,np.float64)
+        Qaccum=np.zeros(hydro.n_2d_links,np.float64)
+        Aaccum=np.zeros(hydro.n_2d_links,np.float64)
         accum_count=0
 
         for ti in range(self.ti_start,self.ti_stop):
             t_sec=hydro.t_secs[ti]
-            flows=[ hydro.flows(t_sec) for hydro in [self.hydro_tidal,self.hydro]]
+            flows=[ h.flows(t_sec) for h in [self.hydro_tidal,self.hydro]]
             flow_hp=flows[0] - flows[1]
             # depth-integrate
             flow_hor=flow_hp[:self.hydro_tidal.n_exch_x]
-            link_flows=np.bincount( self.hydro.exch_to_2d_link['link'],
-                                    self.hydro.exch_to_2d_link['sgn']*flow_hor)
+            link_flows=np.bincount( hydro.exch_to_2d_link['link'],
+                                    hydro.exch_to_2d_link['sgn']*flow_hor)
             
             Qaccum+=link_flows**2
-            Aaccum+=np.bincount( self.hydro.exch_to_2d_link['link'],self.hydro.areas(t_sec)[:self.hydro.n_exch_x])
+            Aaccum+=np.bincount( hydro.exch_to_2d_link['link'], hydro.areas(t_sec)[:self.hydro.n_exch_x])
             accum_count+=1
         rms_flows=np.sqrt(Qaccum/accum_count)
         mean_A=Aaccum/accum_count
         
-        Lexch=self.hydro.exchange_lengths.sum(axis=1)[:self.hydro.n_exch_x]
-        L=[Lexch[exchs[0]] for l,exchs in utils.enumerate_groups(self.hydro.exch_to_2d_link['link'])]
+        Lexch=hydro.exchange_lengths.sum(axis=1)[:hydro.n_exch_x]
+        L=[Lexch[exchs[0]] for l,exchs in utils.enumerate_groups(hydro.exch_to_2d_link['link'])]
         
-        # This is just a placeholder. A proper scaling needs to account for 
-        # cell size. rms_flows has units of m3/s. probably that should be normalized
-        # by dividing by average flux area, and possibly multiplying by the distance
-        # between cell centers. that doesn't seem quite right.
+        # This is a rough scaling.
+        # rms_flows has units of m3/s. normalize
+        # by dividing by average flux area, and multiply by the distance
+        # between cell centers.
         link_K=self.K_scale*rms_flows*L/mean_A
         K[:self.hydro.n_exch_x]=link_K[self.hydro.exch_to_2d_link['link']]
         

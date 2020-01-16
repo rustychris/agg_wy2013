@@ -8,9 +8,9 @@ import datetime
 import stompy.model.delft.waq_scenario as waq
 
 # Inputs:
-agg_grid_shp="Agg2Shapefile_edited/agg_shapefile_edited.shp"
+agg_grid_shp="../boxes-v02.shp"
 hyd_fn="/hpcvol1/public/sfb_dfm_v2/wy2013c/DFM_DELWAQ_wy2013c_adj/wy2013c.hyd"
-output_fn="wy2013c-agg/wy2013c-agg.hyd"
+output_fn="wy2013c-agg-with_tau/wy2013c-agg.hyd"
 
 
 #----------
@@ -79,7 +79,8 @@ class Writer(waq.Scenario):
 # whole run.
 sec=datetime.timedelta(seconds=1)
 start_time=hydro_agg.time0+hydro_agg.t_secs[ 0]*sec
-stop_time =hydro_agg.time0+hydro_agg.t_secs[-1]*sec
+# For debugging, just output a few steps (otherwise -1)
+stop_time =hydro_agg.time0+hydro_agg.t_secs[100]*sec
 
 # probably would have been better to just pass name, desc, base_path in here,
 # rather than using a shell subclass.
